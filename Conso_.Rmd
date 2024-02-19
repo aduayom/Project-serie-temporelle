@@ -1,0 +1,681 @@
+---
+title: "Consommation de gaz dans les métropoles françaises"
+author: "ADUAYOM Daniel & SADIO Ndeye Salimata"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+## Librairies utiles
+
+```{r}
+options(warn = -1)
+library(leaflet)
+library(ggplot2)
+library(sf)
+library(ggmap)
+library(maps)
+library(tseries)
+library(dplyr)
+library(forecast)
+library(stats)
+library(lubridate)
+library(dplyr)
+library(tidyverse)
+set.seed(123)  
+```
+
+## Lecture des données
+
+```{r }
+donnees <- read.csv2('https://opendata.reseaux-energies.fr/explore/dataset/conso-gaz-metropole/download?format=csv&timezone=Europe/Berlin&use_labels_for_header=false')
+
+```
+
+## Data Preprocessing
+
+### Observation des colonnes
+
+```{r }
+# La colonne geom relate les coordonnées des polygones des métropoles. Or nous n'allons pas utliliser cette information, ainsi nous la supprimons.
+donnees$geom <- NULL
+
+# Vérification de données manquantes
+nbre_de_donnees_manquantes <- colSums(is.na(donnees))
+print(nbre_de_donnees_manquantes)
+```
+
+Notre base de donnée est complète.
+
+### Type des données
+
+```{r }
+str(donnees)
+```
+
+```{r }
+# Convertissons la colonne date qui est de type charactère en Date
+donnees$date <- as.Date(paste(donnees$date, "01", sep = "-"), format = "%Y-%m-%d")
+
+# Convertissons la colonne 'centroid' en numeric après avoir tiré la longitude d'une part et
+# la latitude d'autre part
+donnees[c("latitude", "longitude")] <- t(sapply(strsplit(donnees$centroid, ","),as.numeric))
+
+#Affichage des premières lignes
+head(donnees)
+```
+
+## Exploratory Data Analysis (EDA)
+
+### Identifions les villes à plus grosse consommation sur l'année 2023
+
+```{r }
+#Filtre sur 2023
+metropoles_data_23 <- subset(donnees, format(date, "%Y") == "2023")
+
+#Consommation moyenne par métropole
+data_aggregated <- metropoles_data_23 %>%
+  group_by(latitude, longitude,nom_metropole) %>%
+  summarise(ConsommationTotale = mean(consommation))
+
+#Représentation de la consommation moyenne par métropole sur la carte de France (Plus le cercle est gros, plus la consommation est importante)
+carte_gros_consom <- leaflet(data_aggregated) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    ~longitude, ~latitude,
+    radius = ~sqrt(ConsommationTotale) * 0.001,  
+    color = "red",
+    fillOpacity = 0.1,
+    popup = ~paste("Ville: ", nom_metropole, "<br>Consommation: ", ConsommationTotale)
+  )
+carte_gros_consom
+    
+```
+
+### Base d'apprentissage
+
+Dans le cadre de notre étude, nous allons travailler sur les 2 métropoles les plus consommatrices à savoir Paris et Marseille et notre ville, Rennes.
+
+```{r }
+#Filtre sur les colonnes qui nous intéressent
+donnee_filtre <- donnees[, c("date", "nom_metropole","consommation")]
+
+#Filtre sur les trois métropoles retenues
+Paris_conso <- subset(donnee_filtre, nom_metropole == "Métropole du Grand Paris")
+Marseille_conso <- subset(donnee_filtre, nom_metropole == "Métropole d'Aix-Marseille-Provence")
+Rennes_conso<- subset(donnee_filtre, nom_metropole == "Rennes Métropole")
+
+#Fusion
+merged_data <- rbind(
+  transform(Paris_conso),
+  transform(Marseille_conso),
+  transform(Rennes_conso)
+)
+
+#Vérification du type des colonnes
+str(merged_data)
+
+#Aperçu des données
+head(merged_data)
+```
+
+### Présence d'outliers
+
+Testons la présence d'outliers. S'il y en a, ils seront coloriés en rouge.
+
+```{r }
+ggplot(outlier.colour = "red", merged_data, aes(x = nom_metropole, y = consommation, color = nom_metropole)) +
+  geom_boxplot() +
+  theme_classic()
+```
+
+Il n'y a pas d'outliers.
+
+### Evolution de la consommation de gaz dans le temps
+
+```{r }
+ggplot(merged_data, aes(x = date, y = consommation, color = nom_metropole)) +
+  geom_line() +
+  labs(title = "Évolution de la consommation de gaz au cours des années",
+       x = "Date",
+       y = "Consommation") +
+  theme_minimal()
+
+```
+
+On note une baisse en 2020, certainement liée au covid. Néanmoins, il y a une périodicité.
+
+### Résumé Statistique
+
+```{r }
+summary(Rennes_conso)
+summary(Marseille_conso)
+summary(Paris_conso)
+```
+
+Nous notons que nous sommes sur les mêmes échelles en comparant les consommations de Rennes à celles de Paris et Marseille.
+
+### Focus sur l'évolution de la consommation durant l'année 2023
+
+```{r }
+data <- subset(Paris_conso, date >= as.Date("2023-01-01") & date <= as.Date("2023-12-31"))
+ggplot(data, aes(x = date, y = consommation, color = nom_metropole)) +
+  geom_line() +
+  labs(title = "Évolution de la consommation de gaz en 2023 au sein de Paris",
+       x = "Date",
+       y = "Consommation") +
+  theme_minimal()
+
+```
+
+On note une baisse durant l'été , ce qui nous fait penser que la saison peut être une variable explicative.
+
+## Feature engineering: variable saison {Hiver, Printemps , Ete, Automne}
+
+```{r }
+#Fonction de conversion du mois en saison
+month_to_season <- function(mois) {
+  mois <- as.numeric(mois)
+  
+  if (mois %in% 1:3) {
+    return("Hiver")
+  } else if (mois %in% 4:6) {
+    return("Printemps")
+  } else if (mois %in% 7:9) {
+    return("Ete")
+  } else if (mois %in% 10:12) {
+    return("Automne")
+  } else {
+    return("Mois inconnu")
+  }
+}
+
+#Application à notre jeu de données
+merged_data <- merged_data %>% mutate(saison = sapply(month(merged_data$date), month_to_season))
+
+#Vérification
+unique(merged_data$saison)
+
+#Aperçu des données
+head(merged_data)
+```
+
+### Consommation de gaz suivant les saisons et les métropoles
+
+```{r }
+df_grouped <- merged_data %>%
+  group_by(nom_metropole, saison) %>%
+  summarise(Moyenne_Consommation = mean(consommation))
+
+ggplot(df_grouped, aes(x = saison, y = Moyenne_Consommation, fill = nom_metropole)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Consommation moyenne par métropole en fonction des saisons",
+       x = "Saison",
+       y = "Consommation moyenne") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set3")
+```
+
+Nous notons clairement qu'il y a une baisse de consommation durant l'été et le printemps.
+
+## Série Temporelle
+
+### Conversion en série temporelle
+
+```{r }
+Paris_series <- ts(Paris_conso$consommation, start = c(2017, 1), frequency = 12)
+Marseille_series <- ts(Marseille_conso$consommation, start = c(2017, 1), frequency = 12)
+Rennes_series <- ts(Rennes_conso$consommation, start = c(2017, 1), frequency = 12)
+
+#Représentation de la série sur Marseille en guise d'exemple
+autoplot(Marseille_series)  +
+  labs(title = "Série Temporelle sur la consommation de gaz dans la métropole de Marseille")
+```
+
+### Décomposition des séreies temporelles
+
+```{r }
+decomposition_R <- stl(Rennes_series, s.window = "periodic")
+decomposition_P <- stl(Paris_series, s.window = "periodic")
+decomposition_M <- stl(Marseille_series, s.window = "periodic")
+
+# Afficher la décomposition
+autoplot(decomposition_P) + labs(title = "Décomposition STL - Paris")
+autoplot(decomposition_R) + labs(title = "Décomposition STL - Rennes")
+autoplot(decomposition_M) + labs(title = "Décomposition STL - Marseille")
+```
+
+On note une tendance au sein de notre série, et une baisse de la consommation de l'énergie dans les différentes métropoles, à partir dans le mois d'aout et septembre. A priori, il y a une tendance assez similaire dans les deux grandes villes, mais une différence de tendance pour la métropole de Rennes.
+
+## Model Selection
+
+### Tests de stationnarité
+
+```{r }
+# Effectuons le test augmenté de Dickey-Fuller
+adf_test_paris <- adf.test(Paris_series)
+adf_test_marseille <- adf.test(Marseille_series)
+adf_test_rennes <- adf.test(Rennes_series)
+
+kpss_test_paris <-kpss.test(Paris_series)
+kpss_test_marseille <-kpss.test(Marseille_series)
+kpss_test_rennes <-kpss.test(Rennes_series)
+
+# Affichons les résultats du test
+print(adf_test_paris)
+print(adf_test_marseille)
+print(adf_test_rennes)
+
+print(kpss_test_paris)
+print(kpss_test_marseille)
+print(kpss_test_rennes)
+```
+
+Les p_values sont inférieures à 0.05 donc nous rejettons H0 qui parle de non stationnarité Nos différentes séries sont donc bien stationnaires.
+
+### Auto corrélations et autocorélations paritelles
+
+```{r }
+par(mfrow=c(3,1))
+plot(Paris_series, type = "l", col = "blue") 
+acf(Paris_series)
+pacf(Paris_series)
+
+par(mfrow=c(3,1))
+plot(Marseille_series, type = "l", col = "blue") 
+acf(Marseille_series)
+pacf(Marseille_series)
+
+par(mfrow=c(3,1))
+plot(Rennes_series, type = "l", col = "blue") 
+acf(Rennes_series)
+pacf(Rennes_series)
+
+```
+
+En observant nos graphes, nous constatons que l'ACF ne montre pas de corrélation significative au-delà du d́ecalage 0, indiquant une absence de corrélation systématique à long terme et que le PACF montre une dépendance tem- porelle périodique.
+
+### Normalisation
+
+Les trois séries ont des échelles différentes donc afin de pouvoir comparer nos futurs résultats, nous allons procéder à une normalisation.
+
+```{r }
+mean_val <- mean(Marseille_series)
+sd_val <- sd(Marseille_series)
+Marseille_series_norm <- (Marseille_series - mean_val) / sd_val
+
+mean_val <- mean(Paris_series)
+sd_val <- sd(Paris_series)
+Paris_series_norm <- (Paris_series - mean_val) / sd_val
+
+mean_val <- mean(Rennes_series)
+sd_val <- sd(Rennes_series)
+Rennes_series_norm <- (Rennes_series - mean_val) / sd_val
+
+liste_series_temporelles <- list(Marseille_series_norm, Paris_series_norm, Rennes_series_norm)
+liste_series_temporelles
+```
+
+### Critères d'évaluation de la qualité des modèles: AIC et BIC
+
+```{r }
+#Fonction qui retourne les résultats avec le critère BIC 
+test_combinaisons_modeles_BIC <- function(serie, ordre_max = 3) {
+  bic_resultats <- matrix(NA, ncol = 3, nrow = ordre_max^2)
+  colnames(bic_resultats) <- c("AR", "MA", "BIC")
+  k <- 1
+  for (p in 1:ordre_max) {
+    for (q in 1:ordre_max) {
+      ordre_modele <- c(p, 0, q)  
+      modele <- arima(serie, order = ordre_modele, method = "ML")
+      bic_resultats[k, ] <- c(p, q, BIC(modele))
+      k <- k + 1
+    }
+  }
+  return(bic_resultats)
+}
+
+#Fonction qui retourne les résultats avec le critère AIC
+test_combinaisons_modeles_AIC <- function(serie, ordre_max = 3) {
+  aic_resultats <- matrix(NA, ncol = 3, nrow = ordre_max^2)
+  colnames(aic_resultats) <- c("AR", "MA", "AIC")
+  k <- 1
+  for (p in 1:ordre_max) {
+    for (q in 1:ordre_max) {
+      ordre_modele <- c(p, 0, q)  
+      modele <- arima(serie, order = ordre_modele, method = "ML")
+      aic_resultats[k, ] <- c(p, q, AIC(modele))
+      k <- k + 1
+    }
+  }
+  return(aic_resultats)
+}
+
+```
+
+### Résultats des tests
+
+```{r }
+# Application de la fonction à chaque série temporelle
+resultats_AIC <- lapply(liste_series_temporelles, test_combinaisons_modeles_AIC)
+resultats_BIC <- lapply(liste_series_temporelles, test_combinaisons_modeles_BIC)
+print(resultats_AIC)
+print(resultats_BIC)
+```
+
+On constate que l'AIC donne de meilleurs résultats que le BIC.
+
+### Data Training
+
+```{r }
+#Fonction qui effectue l'apprentissage, retourne les résultats
+#Cette fonction prend en entrée la série, la série normée, les ordres et le nom de la série
+#Elle retourne les résultats et le RMSE
+
+plotARMAForecast <- function(series, series_norm, order_arma,name_series) {
+  # Déterminez la taille de l'échantillon d'entraînement
+  train_size <- floor(0.8 * length(series_norm))
+  train_data <- series_norm[1:train_size]
+  test_data <- series_norm[(train_size + 1):length(series_norm)]
+  
+  # Mise en place du modèle ARMA
+  modele_arma <- arima(train_data, order = order_arma)
+  
+  # Faites des prédictions sur l'échantillon de test
+  predictions <- predict(modele_arma, n.ahead = length(test_data))
+  
+  # Dénormalisez les prédictions et les données d'entraînement/test
+  predictions_denorm <- (predictions$pred * sd(series)) + mean(series)
+  test_data_denorm <- (test_data * sd(series)) + mean(series)
+  train_data_denorm <- (train_data * sd(series)) + mean(series)
+  
+  # Créez une séquence de dates pour l'échantillon de test
+  dates_test <- seq_along(test_data)
+  
+  # Créez une séquence de dates pour l'échantillon d'entraînement et de test
+  dates_train <- seq_along(train_data)
+  dates_test <- seq_along(test_data) + length(train_data)
+  
+  # Tracez la série d'entraînement, la série de test et les prédictions
+  # Plot avec la série d'entraînement, la série de test_data et les prédictions en bleu pour     la série de test
+  plot(c(dates_train, dates_test), c(train_data_denorm, test_data_denorm), type = 'l', col = 'black', xlab = 'Time', ylab = 'Value',
+       ylim = range(c(train_data_denorm, test_data_denorm, predictions_denorm)))
+  lines(dates_test, test_data_denorm, col = 'blue')  # Modifier la couleur en bleu
+  lines(dates_test, predictions_denorm, col = 'red')
+  legend("topright", legend = c("Train Data", "Test Data", "Predictions"), col = c('black', 'blue', 'red'), lty = 1, cex = 0.5)
+  title(main = "", sub = name_series, line = 4, cex.main = 1.5, col.main = "black", font.main = 2)
+  
+  # Calcul du RMSE
+  rmse <- sqrt(mean((predictions_denorm - test_data_denorm)^2))
+  cat("RMSE for", name_series, ":", rmse, "\n")
+  
+}
+
+```
+
+#Application à nos séries
+
+```{r }
+par(mfrow = c(2, 2))
+
+plotARMAForecast(Paris_series, Paris_series_norm, c(3, 0, 1), "Paris")
+
+plotARMAForecast(Marseille_series,Marseille_series_norm, c(1, 0, 2),"Marseille")
+
+plotARMAForecast(Rennes_series,Rennes_series_norm, c(3, 0, 2),"Rennes")
+
+```
+
+## Modèle SARIMA
+
+```{r }
+#Différenciations
+ndiffs(Paris_series) 
+ndiffs(Rennes_series)
+ndiffs(Marseille_series)
+
+#Fonction qui effectue l'apprentissage, retourne les résultats
+#Cette fonction prend en entrée la série, la série normée, les ordres et le nom de la série
+#Elle retourne les résultats et le RMSE
+plotSARIMAForecast <- function(series, series_norm, order_arma,order_season,name_series) {
+  # Déterminez la taille de l'échantillon d'entraînement
+  train_size <- floor(0.8 * length(series_norm))
+  train_data <- series_norm[1:train_size]
+  test_data <- series_norm[(train_size + 1):length(series_norm)]
+  
+  # Mise en place du modèle ARMA
+  modele_arma <- arima(series_norm, order = order_arma,
+                       seasonal = list(order = order_season),
+                       include.mean = FALSE,
+                       method = "ML")
+  
+  
+  # Faites des prédictions sur l'échantillon de test
+  predictions <- predict(modele_arma, n.ahead = length(test_data))
+  
+  # Dénormalisez les prédictions et les données d'entraînement/test
+  predictions_denorm <- (predictions$pred * sd(series)) + mean(series)
+  test_data_denorm <- (test_data * sd(series)) + mean(series)
+  train_data_denorm <- (train_data * sd(series)) + mean(series)
+  
+  # Créez une séquence de dates pour l'échantillon de test
+  dates_test <- seq_along(test_data)
+  
+  # Créez une séquence de dates pour l'échantillon d'entraînement et de test
+  dates_train <- seq_along(train_data)
+  dates_test <- seq_along(test_data) + length(train_data)
+  
+  # Tracé
+  
+  # Tracez la série d'entraînement, la série de test_data et les prédictions
+
+  plot(c(dates_train, dates_test), c(train_data, test_data), type = 'l', col = 'black', xlab = 'Time', ylab = 'Value',
+       ylim = range(c(train_data, test_data, predictions$pred)))
+  lines(dates_test, test_data, col = 'blue')  # Modifier la couleur en vert
+  lines(dates_test, predictions$pred, col = 'red')
+  legend("topright", legend = c("Train Data", "Test Data", "Predictions"), col = c('black', 'blue', 'red'), lty = 1, cex = 0.5)
+  title(main = "", sub = name_series, line = 4, cex.main = 1.5, col.main = "black", font.main = 2)
+  
+  # Calcul du RMSE
+  rmse <- sqrt(mean((predictions_denorm - test_data_denorm)^2))
+  cat("RMSE for", name_series, ":", rmse, "\n")
+  
+}
+
+```
+
+#Déterminons P, Q et D.
+
+```{r }
+auto_sarima <- auto.arima(Marseille_series_norm, D=1, trace=TRUE)
+```
+
+```{r }
+auto_sarima <- auto.arima(Paris_series_norm, D=1, trace=TRUE)
+```
+
+```{r }
+auto_sarima <- auto.arima(Rennes_series_norm, D=1, trace=TRUE)
+```
+
+```{r }
+par(mfrow = c(2, 2))
+
+plotSARIMAForecast(Paris_series,Paris_series_norm, c(3, 0, 1),c(0,1,1),"Paris")
+
+plotSARIMAForecast(Rennes_series,Rennes_series_norm, c(3, 0, 2),c(0,1,1),"Rennes")
+
+plotSARIMAForecast(Marseille_series,Marseille_series_norm, c(2, 0, 2),c(2,1,0),"Marseille")
+
+par(mfrow = c(1, 1))
+
+```
+
+```{r }
+# Modèle SARIMAX avec variable saison
+Paris_conso <- subset(donnee_filtre, nom_metropole == "Métropole du Grand Paris")
+Marseille_conso <- subset(donnee_filtre, nom_metropole == "Métropole d'Aix-Marseille-Provence")
+Rennes_conso<- subset(donnee_filtre, nom_metropole == "Rennes Métropole")
+
+#Application à notre jeu de données
+Paris_conso_with_month <- Paris_conso %>% mutate(saison = sapply(month(Paris_conso$date), month_to_season))
+Paris_conso_with_month$saison <- as.numeric(factor(Paris_conso_with_month$saison))
+
+Rennes_conso_with_month <- Rennes_conso %>% mutate(saison = sapply(month(Rennes_conso$date), month_to_season))
+Rennes_conso_with_month$saison <- as.numeric(factor(Rennes_conso_with_month$saison))
+
+Marseille_conso_with_month <- Marseille_conso %>% mutate(saison = sapply(month(Marseille_conso$date), month_to_season))
+Marseille_conso_with_month$saison <- as.numeric(factor(Marseille_conso_with_month$saison))
+
+# Décomposition de l'aspect temporelle pour mieux prendre en compte la baisse aout et la métropole
+# Modèle SARIMAX avec variables exogènes
+# Créer une série temporelle
+ts_data <- ts(Marseille_conso_with_month[, -1], frequency = 12)  # Supprimer la colonne "date" et "consommation"
+
+# Diviser l'échantillon en train et test (par exemple, 80% train et 20% test)
+
+train_data <- subset(Marseille_conso_with_month, format(date, "%Y") <= "2022")
+train_data<- ts(train_data[, -1], frequency = 12)
+plot(train_data)
+
+test_data <- subset(Marseille_conso_with_month, format(date, "%Y") >= "2022")
+test_data<- ts(test_data[, -1], frequency = 12)
+plot(test_data)
+
+
+# Modéliser avec SARIMAX
+y_sacle<- scale(train_data[, "consommation"])
+
+# Conserver la moyenne et l'écart type pour la dénormalisation ultérieure
+mean_train <- mean(train_data[, "consommation"])
+sd_train <- sd(train_data[, "consommation"])
+
+ndiffs(test_data[, "consommation"])
+order_arima <- c(1, 0, 2)  # Ordre de l'autorégression
+seasonal_order <- c(0,1,1)  # Ordre saisonnier
+
+
+# Modéliser avec SARIMAX
+sarimax_model <- Arima(y_sacle, order = order_arima, seasonal = seasonal_order, xreg = train_data[, "saison"])
+
+# Prédire sur l'échantillon test
+sarimax_forecast <- forecast(sarimax_model, xreg = test_data[, "saison"])
+# Comparer les prédictions avec les valeurs réelles
+# Dénormaliser la série
+y_pred_denormalized <- (sarimax_forecast$mean * sd_train) + mean_train
+
+
+# Créer un dataframe
+# Utiliser coredata() pour extraire les valeurs numériques
+time_series_values <- as.vector(sarimax_forecast$fitted)
+Pred_extrac<- data.frame(value = time_series_values)
+par(mfrow = c(2, 2))
+plot(scale(test_data[, "consommation"]), type = 'l', col = 'blue', ylab = 'Consommation', xlab = 'Temps', main = 'Prédictions SARIMAX vs Réalité')
+lines(Pred_extrac$value, col = 'red')
+#legend("topleft", legend = c("Réalité", "Prédictions SARIMAX"), col = c("blue", "red"), lty #= 1
+       
+par(mfrow = c(1, 1))
+
+```
+
+Nous allons à présent rajouter la variable temprératue moyenne et remettre en place notre modèle SARIMAX et comparer les résultats avec ceux précédemment obtenus 
+
+```{r }
+
+# Spécifier le chemin vers votre fichier CSV
+chemin_fichier <- "./Data/MENSQ_02_previous-1950-2022.csv"
+
+# Importer la base de données CSV avec le séparateur ";"
+Temperature <- read.csv2(chemin_fichier, sep = ";")
+
+# Sélectionner les deux colonnes spécifiques (remplacez "Colonne1" et "Colonne2" par les noms réels de vos colonnes)
+Temperature <- Temperature %>% 
+  select(AAAAMM, TX)
+
+# Formater la colonne de dates au format "AAAA-MM-01"
+Temperature <- Temperature %>% 
+  mutate(date = as.Date(paste0(AAAAMM, "01"), format = "%Y%m%d"))
+
+Temperature <- Temperature %>% 
+  select(date, TX)
+
+Temperature <- Temperature %>% 
+  mutate(TX = as.numeric(TX))
+
+head(Temperature)
+```
+
+
+```{r }
+# Filtrer les données pour prendre uniquement celles entre 2017 et 2022
+Temperature <- Temperature %>% 
+  filter(date >= as.Date("2017-01-01") & date <= as.Date("2022-12-31"))
+
+# Sélectionner les 72 premières lignes
+Temperature <- Temperature %>% 
+  slice(1:72)
+
+# Afficher les données finales
+head(Temperature)
+
+```
+
+
+```{r }
+Paris_conso_with_month_filtred<- Paris_conso_with_month %>% 
+  filter(date <= as.Date("2022-12-01") )
+
+# Fusionner les dataframes sur la colonne "Date"
+Merge_temperature_conso <- merge(Paris_conso_with_month_filtred, Temperature, by = "date")
+
+# Afficher le résultat
+head(Merge_temperature_conso)
+```
+
+```{r }
+# Décomposition de l'aspect temporelle pour mieux prendre en compte la baisse aout et la métropole
+# Modèle SARIMAX avec variables exogènes
+# Créer une série temporelle
+ts_data <- ts(Merge_temperature_conso[, -1], frequency = 12)  # Supprimer la colonne "date" et "consommation"
+
+# Diviser l'échantillon en train et test (par exemple, 80% train et 20% test)
+
+train_data <- subset(Merge_temperature_conso, format(date, "%Y") <= "2021")
+train_data<- ts(train_data[, -1], frequency = 12)
+plot(train_data)
+
+test_data <- subset(Merge_temperature_conso, format(date, "%Y") >= "2021")
+test_data<- ts(test_data[, -1], frequency = 12)
+plot(test_data)
+
+
+# Modéliser avec SARIMAX
+y_sacle<- scale(train_data[, "consommation"])
+
+# Conserver la moyenne et l'écart type pour la dénormalisation ultérieure
+mean_train <- mean(train_data[, "consommation"])
+sd_train <- sd(train_data[, "consommation"])
+
+ndiffs(test_data[, "consommation"])
+order_arima <- c(3, 0, 1)  # Ordre de l'autorégression
+seasonal_order <- c(0,1,1)  # Ordre saisonnier
+
+# Modéliser avec SARIMAX
+sarimax_model <- Arima(y_sacle, order = order_arima, seasonal = seasonal_order, xreg = train_data[, c("saison","TX")])
+
+# Prédire sur l'échantillon test
+sarimax_forecast <- forecast(sarimax_model, xreg = test_data[, c("saison","TX")])
+# Comparer les prédictions avec les valeurs réelles
+# Dénormaliser la série
+y_pred_denormalized <- (sarimax_forecast$mean * sd_train) + mean_train
+
+
+# Créer un dataframe
+# Utiliser coredata() pour extraire les valeurs numériques
+time_series_values <- as.vector(sarimax_forecast$fitted)
+Pred_extrac<- data.frame(value = time_series_values)
+
+plot(scale(test_data[, "consommation"]), type = 'l', col = 'blue', ylab = 'Consommation', xlab = 'Temps', main = 'Prédictions SARIMAX vs Réalité')
+lines(Pred_extrac$value, col = 'red')
+#legend("topleft", legend = c("Réalité", "Prédictions SARIMAX"), col = c("blue", "red"), lty #= 1
+```
